@@ -44,6 +44,28 @@ static char *trim_whitespace(char *s) {
     return s;
 }
 
+// New helper: process a single (null-terminated) command line.
+// Reused by both TCP client thread and UDP thread.
+static void process_command_line(char *line) {
+    char *trimmed = trim_whitespace(line);
+    if (strlen(trimmed) == 0) {
+        printf("[DEBUG] Empty command line\n");
+        return;
+    }
+    if (strncmp(trimmed, "SCROLL:", 7) == 0) {
+        char *numpart = trimmed + 7;
+        numpart = trim_whitespace(numpart);
+        long d = strtol(numpart, NULL, 10);
+        printf("[DEBUG] SCROLL delta %ld\n", d);
+        send_wheel((int)d);
+    } else if (_stricmp(trimmed, "DISCONNECT") == 0) {
+        // For UDP this doesn't apply; TCP path handles explicit disconnect.
+        printf("[DEBUG] DISCONNECT command received (UDP ignored)\n");
+    } else {
+        printf("[DEBUG] Unknown command: '%s'\n", trimmed);
+    }
+}
+
 DWORD WINAPI handle_client_thread(LPVOID param) {
     client_info_t *ci = (client_info_t*)param;
     SOCKET conn = ci->sock;
@@ -127,6 +149,39 @@ DWORD WINAPI handle_client_thread(LPVOID param) {
     return 0;
 }
 
+// New: UDP receive thread. Each incoming datagram is treated as a single command (fire-and-forget).
+DWORD WINAPI udp_thread_func(LPVOID param) {
+    SOCKET udpSock = (SOCKET)(ULONG_PTR)param;
+    char recvbuf[RECV_BUF + 1];
+    struct sockaddr_storage src;
+    int srclen = sizeof(src);
+    char addrstr[NI_MAXHOST] = {0}, portstr[NI_MAXSERV] = {0};
+
+    while (1) {
+        struct sockaddr_in from4;
+        int fromlen = sizeof(from4);
+        int r = recvfrom(udpSock, recvbuf, RECV_BUF, 0, (struct sockaddr*)&from4, &fromlen);
+        if (r == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            // If program is shutting down, socket may be closed; exit thread.
+            printf("[DEBUG] UDP recvfrom error: %d\n", err);
+            break;
+        }
+        recvbuf[r] = '\0';
+        // optional: print source
+        if (getnameinfo((struct sockaddr*)&from4, fromlen, addrstr, sizeof(addrstr), portstr, sizeof(portstr),
+                        NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+            printf("[DEBUG] UDP packet from %s:%s (%d bytes)\n", addrstr, portstr, r);
+        } else {
+            printf("[DEBUG] UDP packet (%d bytes)\n", r);
+        }
+
+        // Process the datagram as a single command line (fire-and-forget)
+        process_command_line(recvbuf);
+    }
+    return 0;
+}
+
 int main(void) {
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
@@ -134,129 +189,198 @@ int main(void) {
         return 1;
     }
 
-    char real_ip[INET6_ADDRSTRLEN] = {0};
-    // Determine real IP via UDP connect
-    SOCKET s2 = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s2 != INVALID_SOCKET) {
-        struct sockaddr_in google;
-        memset(&google, 0, sizeof(google));
-        google.sin_family = AF_INET;
-        google.sin_port = htons(80);
-        inet_pton(AF_INET, "8.8.8.8", &google.sin_addr);
-        if (connect(s2, (struct sockaddr*)&google, sizeof(google)) != SOCKET_ERROR) {
-            struct sockaddr_in local;
-            int addrlen = sizeof(local);
-            if (getsockname(s2, (struct sockaddr*)&local, &addrlen) != SOCKET_ERROR) {
-                inet_ntop(AF_INET, &local.sin_addr, real_ip, sizeof(real_ip));
-                printf("[DEBUG] Real IP determined: %s\n", real_ip);
-            } else {
-                printf("[DEBUG] getsockname failed: %d; falling back\n", WSAGetLastError());
-            }
-        } else {
-            printf("[DEBUG] UDP connect failed: %d; falling back\n", WSAGetLastError());
+    int choice = 0;
+    while (choice != 1 && choice != 2) {
+        printf("Press 1 for udp or press 2 for tcp: ");
+        int c = getchar();
+        if (c == EOF) {
+            fprintf(stderr, "[DEBUG] No input, exiting\n");
+            WSACleanup();
+            return 1;
         }
-        closesocket(s2);
-    } else {
-        printf("[DEBUG] UDP socket creation failed: %d; falling back\n", WSAGetLastError());
+        /* consume rest of line */
+        int d;
+        while ((d = getchar()) != '\n' && d != EOF) { /* skip */ }
+        if (c == '1') choice = 1;
+        else if (c == '2') choice = 2;
+        else printf("Invalid choice. Please press 1 or 2.\n");
     }
 
-    if (real_ip[0] == '\0') {
-        // fallback to hostname lookup
-        char hostname[256];
-        if (gethostname(hostname, sizeof(hostname)) == 0) {
-            struct addrinfo hints = {0}, *res = NULL;
-            hints.ai_family = AF_INET;
-            if (getaddrinfo(hostname, NULL, &hints, &res) == 0 && res) {
-                struct sockaddr_in *sin = (struct sockaddr_in*)res->ai_addr;
-                inet_ntop(AF_INET, &sin->sin_addr, real_ip, sizeof(real_ip));
-                printf("[DEBUG] Hostname IP: %s\n", real_ip);
-                freeaddrinfo(res);
+    int enable_udp = (choice == 1);
+    int enable_tcp = (choice == 2);
+
+    char real_ip[INET6_ADDRSTRLEN] = {0};
+
+    if (enable_tcp) {
+        // Determine real IP via UDP connect (only needed for TCP bind to specific address)
+        SOCKET s2 = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s2 != INVALID_SOCKET) {
+            struct sockaddr_in google;
+            memset(&google, 0, sizeof(google));
+            google.sin_family = AF_INET;
+            google.sin_port = htons(80);
+            inet_pton(AF_INET, "8.8.8.8", &google.sin_addr);
+            if (connect(s2, (struct sockaddr*)&google, sizeof(google)) != SOCKET_ERROR) {
+                struct sockaddr_in local;
+                int addrlen = sizeof(local);
+                if (getsockname(s2, (struct sockaddr*)&local, &addrlen) != SOCKET_ERROR) {
+                    inet_ntop(AF_INET, &local.sin_addr, real_ip, sizeof(real_ip));
+                    printf("[DEBUG] Real IP determined: %s\n", real_ip);
+                } else {
+                    printf("[DEBUG] getsockname failed: %d; falling back\n", WSAGetLastError());
+                }
             } else {
-                printf("[DEBUG] Hostname lookup failed; using %s\n", HOST);
+                printf("[DEBUG] UDP connect failed: %d; falling back\n", WSAGetLastError());
+            }
+            closesocket(s2);
+        } else {
+            printf("[DEBUG] UDP socket creation failed: %d; falling back\n", WSAGetLastError());
+        }
+
+        if (real_ip[0] == '\0') {
+            // fallback to hostname lookup
+            char hostname[256];
+            if (gethostname(hostname, sizeof(hostname)) == 0) {
+                struct addrinfo hints = {0}, *res = NULL;
+                hints.ai_family = AF_INET;
+                if (getaddrinfo(hostname, NULL, &hints, &res) == 0 && res) {
+                    struct sockaddr_in *sin = (struct sockaddr_in*)res->ai_addr;
+                    inet_ntop(AF_INET, &sin->sin_addr, real_ip, sizeof(real_ip));
+                    printf("[DEBUG] Hostname IP: %s\n", real_ip);
+                    freeaddrinfo(res);
+                } else {
+                    printf("[DEBUG] Hostname lookup failed; using %s\n", HOST);
+                    strncpy(real_ip, HOST, sizeof(real_ip)-1);
+                }
+            } else {
+                printf("[DEBUG] gethostname failed; using %s\n", HOST);
                 strncpy(real_ip, HOST, sizeof(real_ip)-1);
             }
-        } else {
-            printf("[DEBUG] gethostname failed; using %s\n", HOST);
-            strncpy(real_ip, HOST, sizeof(real_ip)-1);
         }
+
+        printf("PC Server (TCP) Starting, ip: %s\n", real_ip);
+    } else {
+        printf("PC Server (UDP) Starting\n");
     }
 
-    printf("PC Server Starting, ip: %s\n", real_ip);
+    SOCKET listen_sock = INVALID_SOCKET;
+    if (enable_tcp) {
+        // Prepare TCP listening socket
+        struct addrinfo hints = {0}, *res = NULL;
+        hints.ai_family = AF_INET; // IPv4
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags = AI_PASSIVE;
+        char portbuf[6];
+        snprintf(portbuf, sizeof(portbuf), "%d", PORT);
 
-    // Prepare TCP listening socket
-    struct addrinfo hints = {0}, *res = NULL;
-    hints.ai_family = AF_INET; // IPv4
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;
-    char portbuf[6];
-    snprintf(portbuf, sizeof(portbuf), "%d", PORT);
+        int rv = getaddrinfo(real_ip, portbuf, &hints, &res);
+        if (rv != 0 || res == NULL) {
+            fprintf(stderr, "[DEBUG] getaddrinfo failed: %d\n", rv);
+            WSACleanup();
+            return 1;
+        }
 
-    int rv = getaddrinfo(real_ip, portbuf, &hints, &res);
-    if (rv != 0 || res == NULL) {
-        fprintf(stderr, "[DEBUG] getaddrinfo failed: %d\n", rv);
-        WSACleanup();
-        return 1;
-    }
+        listen_sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (listen_sock == INVALID_SOCKET) {
+            fprintf(stderr, "[DEBUG] socket failed: %d\n", WSAGetLastError());
+            freeaddrinfo(res);
+            WSACleanup();
+            return 1;
+        }
 
-    SOCKET listen_sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (listen_sock == INVALID_SOCKET) {
-        fprintf(stderr, "[DEBUG] socket failed: %d\n", WSAGetLastError());
+        BOOL opt = TRUE;
+        setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+
+        if (bind(listen_sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR) {
+            fprintf(stderr, "[DEBUG] bind failed: %d\n", WSAGetLastError());
+            closesocket(listen_sock);
+            freeaddrinfo(res);
+            WSACleanup();
+            return 1;
+        }
+
         freeaddrinfo(res);
-        WSACleanup();
-        return 1;
-    }
 
-    BOOL opt = TRUE;
-    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
-
-    if (bind(listen_sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR) {
-        fprintf(stderr, "[DEBUG] bind failed: %d\n", WSAGetLastError());
-        closesocket(listen_sock);
-        freeaddrinfo(res);
-        WSACleanup();
-        return 1;
-    }
-
-    freeaddrinfo(res);
-
-    if (listen(listen_sock, SOMAXCONN) == SOCKET_ERROR) {
-        fprintf(stderr, "[DEBUG] listen failed: %d\n", WSAGetLastError());
-        closesocket(listen_sock);
-        WSACleanup();
-        return 1;
-    }
-
-    printf("Listening on %d\n", PORT);
-    printf("[DEBUG] Accept loop started\n");
-
-    while (1) {
-        client_info_t *ci = (client_info_t*)malloc(sizeof(client_info_t));
-        if (!ci) {
-            fprintf(stderr, "[DEBUG] malloc failed\n");
-            Sleep(100);
-            continue;
-        }
-        ci->addr_len = sizeof(ci->addr);
-        ci->sock = accept(listen_sock, (struct sockaddr*)&ci->addr, &ci->addr_len);
-        if (ci->sock == INVALID_SOCKET) {
-            printf("[DEBUG] accept failed: %d\n", WSAGetLastError());
-            free(ci);
-            continue;
+        if (listen(listen_sock, SOMAXCONN) == SOCKET_ERROR) {
+            fprintf(stderr, "[DEBUG] listen failed: %d\n", WSAGetLastError());
+            closesocket(listen_sock);
+            WSACleanup();
+            return 1;
         }
 
-        printf("Client connected\n");
-        HANDLE th = CreateThread(NULL, 0, handle_client_thread, ci, 0, NULL);
-        if (th) {
-            CloseHandle(th); // let thread run detached
+        printf("Listening (TCP) on %d\n", PORT);
+        printf("[DEBUG] Accept loop started\n");
+    }
+
+    // Create and bind UDP socket if requested
+    SOCKET udp_sock = INVALID_SOCKET;
+    if (enable_udp) {
+        udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (udp_sock == INVALID_SOCKET) {
+            printf("[DEBUG] UDP socket creation failed: %d\n", WSAGetLastError());
+            // continue anyway (but nothing to do)
         } else {
-            printf("[DEBUG] CreateThread failed: %d\n", (int)GetLastError());
-            closesocket(ci->sock);
-            free(ci);
+            struct sockaddr_in bindaddr;
+            memset(&bindaddr, 0, sizeof(bindaddr));
+            bindaddr.sin_family = AF_INET;
+            bindaddr.sin_port = htons(PORT);
+            bindaddr.sin_addr.s_addr = INADDR_ANY; // listen on all interfaces
+            if (bind(udp_sock, (struct sockaddr*)&bindaddr, sizeof(bindaddr)) == SOCKET_ERROR) {
+                printf("[DEBUG] UDP bind failed: %d\n", WSAGetLastError());
+                closesocket(udp_sock);
+                udp_sock = INVALID_SOCKET;
+            } else {
+                HANDLE uthread = CreateThread(NULL, 0, udp_thread_func, (LPVOID)(ULONG_PTR)udp_sock, 0, NULL);
+                if (uthread) {
+                    CloseHandle(uthread); // detached
+                    printf("[DEBUG] UDP listener started on port %d\n", PORT);
+                } else {
+                    printf("[DEBUG] CreateThread for UDP failed: %d\n", (int)GetLastError());
+                    closesocket(udp_sock);
+                    udp_sock = INVALID_SOCKET;
+                }
+            }
+        }
+    }
+
+    // If UDP-only mode, keep main thread alive (UDP thread handles packets)
+    if (enable_udp && !enable_tcp) {
+        printf("UDP ready. Press Ctrl+C to exit.\n");
+        while (1) Sleep(1000);
+    }
+
+    // If TCP mode, run accept loop (no UDP)
+    if (enable_tcp) {
+        while (1) {
+            client_info_t *ci = (client_info_t*)malloc(sizeof(client_info_t));
+            if (!ci) {
+                fprintf(stderr, "[DEBUG] malloc failed\n");
+                Sleep(100);
+                continue;
+            }
+            ci->addr_len = sizeof(ci->addr);
+            ci->sock = accept(listen_sock, (struct sockaddr*)&ci->addr, &ci->addr_len);
+            if (ci->sock == INVALID_SOCKET) {
+                printf("[DEBUG] accept failed: %d\n", WSAGetLastError());
+                free(ci);
+                continue;
+            }
+
+            printf("Client connected\n");
+            HANDLE th = CreateThread(NULL, 0, handle_client_thread, ci, 0, NULL);
+            if (th) {
+                CloseHandle(th); // let thread run detached
+            } else {
+                printf("[DEBUG] CreateThread failed: %d\n", (int)GetLastError());
+                closesocket(ci->sock);
+                free(ci);
+            }
         }
     }
 
     // Never reached in normal operation
-    closesocket(listen_sock);
+    if (udp_sock != INVALID_SOCKET) closesocket(udp_sock);
+    if (listen_sock != INVALID_SOCKET) closesocket(listen_sock);
     WSACleanup();
     return 0;
 }
